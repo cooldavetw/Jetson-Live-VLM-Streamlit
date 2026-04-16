@@ -5,12 +5,11 @@ Streamlit live camera demo:
 - Send it to an OpenAI-compatible VLM (e.g. moondream via Ollama)
 - Show responses on the right as a dialogue
 
-pip install streamlit openai pillow streamlit-autorefresh streamlit-webrtc
+pip install streamlit openai pillow
 """
 
 import base64
 import io
-import queue
 import time
 from dataclasses import dataclass
 from typing import Tuple
@@ -18,8 +17,332 @@ from typing import Tuple
 from openai import OpenAI
 from PIL import Image
 import streamlit as st
-from streamlit_autorefresh import st_autorefresh
-from streamlit_webrtc import WebRtcMode, webrtc_streamer
+
+
+CAMERA_COMPONENT = st.components.v2.component(
+    "browser_camera_snapshot",
+    html="""
+<div class="camera-shell">
+  <div class="camera-preview-wrap">
+    <video class="camera-preview" autoplay playsinline muted></video>
+    <div class="camera-placeholder">Camera inactive</div>
+  </div>
+  <canvas class="camera-canvas" aria-hidden="true"></canvas>
+  <div class="camera-controls">
+    <button class="camera-start" type="button">Start</button>
+    <button class="camera-stop" type="button" disabled>Stop</button>
+    <button class="camera-snapshot" type="button" disabled>Capture now</button>
+    <select class="camera-device-select" disabled>
+      <option value="">Default camera</option>
+    </select>
+  </div>
+  <div class="camera-status">Waiting to start camera.</div>
+</div>
+""",
+    css="""
+:host {
+  display: block;
+}
+
+.camera-shell {
+  color: var(--st-text-color);
+  font-family: var(--st-font, sans-serif);
+}
+
+.camera-preview-wrap {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  border-radius: 0.75rem;
+  overflow: hidden;
+  background: #0b1220;
+  border: 1px solid color-mix(in srgb, var(--st-text-color) 14%, transparent);
+}
+
+.camera-preview {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: none;
+  background: #000;
+}
+
+.camera-preview.is-active {
+  display: block;
+}
+
+.camera-placeholder {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: color-mix(in srgb, white 75%, transparent);
+  font-size: 1rem;
+  letter-spacing: 0.02em;
+}
+
+.camera-placeholder.is-hidden {
+  display: none;
+}
+
+.camera-controls {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-top: 0.9rem;
+}
+
+.camera-controls button,
+.camera-controls select {
+  min-height: 2.5rem;
+  border-radius: 0.7rem;
+  border: 1px solid color-mix(in srgb, var(--st-text-color) 16%, transparent);
+  background: var(--st-secondary-background-color);
+  color: var(--st-text-color);
+  padding: 0 0.9rem;
+  font: inherit;
+}
+
+.camera-controls button {
+  cursor: pointer;
+}
+
+.camera-controls button:disabled,
+.camera-controls select:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.camera-start {
+  background: var(--st-primary-color);
+  color: white;
+  border-color: transparent;
+}
+
+.camera-status {
+  margin-top: 0.75rem;
+  color: color-mix(in srgb, var(--st-text-color) 75%, transparent);
+  font-size: 0.95rem;
+}
+
+.camera-canvas {
+  display: none;
+}
+""",
+    js="""
+const INSTANCES = new WeakMap();
+
+function createInstance(component) {
+  const { parentElement } = component;
+  const root = parentElement.querySelector(".camera-shell");
+  const video = root.querySelector(".camera-preview");
+  const placeholder = root.querySelector(".camera-placeholder");
+  const canvas = root.querySelector(".camera-canvas");
+  const startBtn = root.querySelector(".camera-start");
+  const stopBtn = root.querySelector(".camera-stop");
+  const snapshotBtn = root.querySelector(".camera-snapshot");
+  const deviceSelect = root.querySelector(".camera-device-select");
+  const statusEl = root.querySelector(".camera-status");
+
+  const instance = {
+    component,
+    root,
+    video,
+    placeholder,
+    canvas,
+    startBtn,
+    stopBtn,
+    snapshotBtn,
+    deviceSelect,
+    statusEl,
+    stream: null,
+    timerId: null,
+    currentDeviceId: "",
+    lastCaptureTs: 0,
+    lastStatus: null,
+    lastPlaying: null,
+  };
+
+  instance.setStatus = (message, isError = false) => {
+    statusEl.textContent = message;
+    statusEl.style.color = isError
+      ? "var(--st-red-70)"
+      : "color-mix(in srgb, var(--st-text-color) 75%, transparent)";
+    const playing = Boolean(instance.stream);
+    if (instance.lastStatus !== message) {
+      instance.component.setStateValue("status", message);
+      instance.lastStatus = message;
+    }
+    if (instance.lastPlaying !== playing) {
+      instance.component.setStateValue("playing", playing);
+      instance.lastPlaying = playing;
+    }
+  };
+
+  instance.setPreviewActive = (active) => {
+    video.classList.toggle("is-active", active);
+    placeholder.classList.toggle("is-hidden", active);
+    stopBtn.disabled = !active;
+    snapshotBtn.disabled = !active;
+  };
+
+  instance.stopStream = () => {
+    if (instance.timerId) {
+      clearInterval(instance.timerId);
+      instance.timerId = null;
+    }
+    if (instance.stream) {
+      instance.stream.getTracks().forEach((track) => track.stop());
+      instance.stream = null;
+    }
+    video.srcObject = null;
+    instance.setPreviewActive(false);
+    instance.setStatus("Camera stopped.");
+  };
+
+  instance.captureFrame = (source) => {
+    if (!instance.stream || video.readyState < 2) {
+      instance.setStatus("Camera frame is not ready yet.", true);
+      return;
+    }
+
+    const width = video.videoWidth || 640;
+    const height = video.videoHeight || 360;
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(video, 0, 0, width, height);
+    const imageDataUrl = canvas.toDataURL("image/jpeg", 0.85);
+    const ts = Date.now();
+    instance.lastCaptureTs = ts;
+    instance.component.setTriggerValue("capture", {
+      image_data_url: imageDataUrl,
+      ts,
+      source,
+    });
+    instance.setStatus(
+      source === "auto"
+        ? "Captured frame and sent it to the app."
+        : "Captured frame."
+    );
+  };
+
+  instance.scheduleCapture = () => {
+    if (instance.timerId) {
+      clearInterval(instance.timerId);
+      instance.timerId = null;
+    }
+    if (!instance.stream) {
+      return;
+    }
+
+    const intervalSec = Math.max(1, Number(instance.component.data?.interval_seconds || 5));
+    instance.timerId = window.setInterval(() => {
+      instance.captureFrame("auto");
+    }, intervalSec * 1000);
+  };
+
+  instance.refreshDevices = async () => {
+    if (!navigator.mediaDevices?.enumerateDevices) {
+      deviceSelect.disabled = true;
+      return;
+    }
+
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const videoInputs = devices.filter((device) => device.kind === "videoinput");
+      const previousValue = instance.currentDeviceId;
+      deviceSelect.innerHTML = "";
+
+      const fallbackOption = document.createElement("option");
+      fallbackOption.value = "";
+      fallbackOption.textContent = "Default camera";
+      deviceSelect.appendChild(fallbackOption);
+
+      videoInputs.forEach((device, index) => {
+        const option = document.createElement("option");
+        option.value = device.deviceId;
+        option.textContent = device.label || `Camera ${index + 1}`;
+        deviceSelect.appendChild(option);
+      });
+
+      deviceSelect.value = previousValue;
+      deviceSelect.disabled = videoInputs.length === 0;
+    } catch (error) {
+      instance.setStatus(`Could not list cameras: ${error.message}`, true);
+    }
+  };
+
+  instance.startStream = async (deviceId = "") => {
+    instance.stopStream();
+    instance.currentDeviceId = deviceId;
+    instance.setStatus("Requesting camera access...");
+
+    try {
+      const constraints = {
+        video: deviceId
+          ? { deviceId: { exact: deviceId } }
+          : true,
+        audio: false,
+      };
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      instance.stream = stream;
+      video.srcObject = stream;
+      await video.play();
+      instance.setPreviewActive(true);
+      await instance.refreshDevices();
+      if (instance.currentDeviceId) {
+        deviceSelect.value = instance.currentDeviceId;
+      }
+      instance.setStatus(
+        `Camera active. Capturing every ${Math.max(1, Number(instance.component.data?.interval_seconds || 5))} seconds.`
+      );
+      instance.scheduleCapture();
+    } catch (error) {
+      instance.stopStream();
+      instance.setStatus(`Camera error: ${error.message}`, true);
+    }
+  };
+
+  startBtn.addEventListener("click", () => {
+    instance.startStream(deviceSelect.value);
+  });
+
+  stopBtn.addEventListener("click", () => {
+    instance.stopStream();
+  });
+
+  snapshotBtn.addEventListener("click", () => {
+    instance.captureFrame("manual");
+  });
+
+  deviceSelect.addEventListener("change", () => {
+    instance.startStream(deviceSelect.value);
+  });
+
+  instance.setPreviewActive(false);
+  instance.refreshDevices();
+  return instance;
+}
+
+export default function(component) {
+  let instance = INSTANCES.get(component.parentElement);
+  if (!instance) {
+    instance = createInstance(component);
+    INSTANCES.set(component.parentElement, instance);
+  }
+
+  instance.component = component;
+  if (instance.stream) {
+    instance.scheduleCapture();
+    instance.setStatus(
+      `Camera active. Capturing every ${Math.max(1, Number(component.data?.interval_seconds || 5))} seconds.`
+    );
+  }
+}
+""",
+)
 
 
 # ---------------------------------------------------------------------
@@ -73,7 +396,15 @@ def call_vlm(cfg: VLMConfig, image: Image.Image) -> Tuple[str, float]:
     return text, latency_ms
 
 
-def run_inference(cfg: VLMConfig, image: Image.Image) -> None:
+def decode_image_data_url(image_data_url: str) -> Image.Image:
+    header, encoded = image_data_url.split(",", 1)
+    if ";base64" not in header:
+        raise ValueError("Unsupported image data URL format.")
+    image_bytes = base64.b64decode(encoded)
+    return Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+
+def run_inference(cfg: VLMConfig, image: Image.Image, source: str) -> None:
     try:
         resized = image.resize((640, 360))
         latest_text, latest_latency = call_vlm(cfg, resized)
@@ -85,20 +416,8 @@ def run_inference(cfg: VLMConfig, image: Image.Image) -> None:
         "text": latest_text,
         "latency": latest_latency,
         "ts": time.time(),
+        "source": source,
     }
-
-
-def get_latest_camera_frame(ctx) -> Image.Image | None:
-    if not ctx or not ctx.state.playing or not ctx.video_receiver:
-        return None
-
-    try:
-        frame = ctx.video_receiver.get_frame(timeout=1)
-    except queue.Empty:
-        return None
-
-    frame_rgb = frame.to_ndarray(format="rgb24")
-    return Image.fromarray(frame_rgb)
 
 
 # ---------------------------------------------------------------------
@@ -124,8 +443,6 @@ def main():
         st.session_state.vlm_latest = None  # dict: {text, latency, ts}
     if "capture_interval_sec" not in st.session_state:
         st.session_state.capture_interval_sec = 5
-    if "last_auto_capture_ts" not in st.session_state:
-        st.session_state.last_auto_capture_ts = 0.0
 
     # ---- Sidebar: config UI ----
     with st.sidebar:
@@ -164,54 +481,33 @@ def main():
     # ---- 左側：Camera & snapshot ----
     with col1:
         st.subheader("Webcam")
-        ctx = webrtc_streamer(
-            key="live_camera",
-            mode=WebRtcMode.SENDRECV,
-            media_stream_constraints={"video": True, "audio": False},
-            rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
-            async_processing=True,
-        )
-        manual_run_btn = st.button(
-            "Run VLM now",
-            type="primary",
-            use_container_width=True,
-            disabled=not (ctx and ctx.state.playing),
+        camera_result = CAMERA_COMPONENT(
+            key="browser_camera",
+            data={"interval_seconds": st.session_state.capture_interval_sec},
+            on_capture_change=lambda: None,
+            on_status_change=lambda: None,
+            on_playing_change=lambda: None,
         )
         st.caption(
             f"When the webcam is active, the latest frame is sent to the VLM every "
             f"{st.session_state.capture_interval_sec} seconds."
         )
+        if getattr(camera_result, "status", None):
+            st.caption(camera_result.status)
 
-    if ctx and ctx.state.playing:
-        st_autorefresh(
-            interval=st.session_state.capture_interval_sec * 1000,
-            key="vlm_auto_capture_refresh",
-        )
-
-    # ---- Run inference when button pressed ----
-    if manual_run_btn:
+    capture_event = getattr(camera_result, "capture", None)
+    if capture_event and capture_event.get("image_data_url"):
         with st.spinner("Running VLM..."):
-            frame_image = get_latest_camera_frame(ctx)
-            if frame_image is not None:
-                run_inference(cfg_snapshot, frame_image)
-                st.session_state.last_auto_capture_ts = time.time()
-            else:
+            try:
+                frame_image = decode_image_data_url(capture_event["image_data_url"])
+                run_inference(cfg_snapshot, frame_image, capture_event.get("source", "auto"))
+            except Exception as exc:
                 st.session_state.vlm_latest = {
-                    "text": "Error: no webcam frame available yet.",
+                    "text": f"Error: {exc}",
                     "latency": 0.0,
                     "ts": time.time(),
+                    "source": "error",
                 }
-    elif ctx and ctx.state.playing:
-        now = time.time()
-        elapsed = now - st.session_state.last_auto_capture_ts
-        if elapsed >= st.session_state.capture_interval_sec:
-            frame_image = get_latest_camera_frame(ctx)
-            if frame_image is not None:
-                run_inference(cfg_snapshot, frame_image)
-                st.session_state.last_auto_capture_ts = now
-    elif st.session_state.vlm_latest:
-        latest_text = st.session_state.vlm_latest["text"]
-        latest_latency = st.session_state.vlm_latest["latency"]
 
     # ---- 右側：對話視窗 ----
     with col2:
@@ -221,7 +517,9 @@ def main():
             msg = st.session_state.vlm_latest
             with st.chat_message("assistant"):
                 st.markdown(msg["text"])
-                st.caption(f"Latency: {msg['latency']:.0f} ms")
+                st.caption(
+                    f"Latency: {msg['latency']:.0f} ms | Source: {msg.get('source', 'auto')}"
+                )
         else:
             st.info("Waiting for the webcam stream and first response from the VLM...")
 
