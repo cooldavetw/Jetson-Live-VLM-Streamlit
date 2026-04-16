@@ -404,6 +404,16 @@ def decode_image_data_url(image_data_url: str) -> Image.Image:
     return Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
 
+def add_history_message(text: str, latency: float, source: str) -> None:
+    st.session_state.vlm_latest = {
+        "text": text,
+        "latency": latency,
+        "ts": time.time(),
+        "source": source,
+    }
+    st.session_state.vlm_history.append(st.session_state.vlm_latest.copy())
+
+
 def run_inference(cfg: VLMConfig, image: Image.Image, source: str) -> None:
     try:
         resized = image.resize((640, 360))
@@ -412,12 +422,7 @@ def run_inference(cfg: VLMConfig, image: Image.Image, source: str) -> None:
         latest_text = f"Error: {exc}"
         latest_latency = 0.0
 
-    st.session_state.vlm_latest = {
-        "text": latest_text,
-        "latency": latest_latency,
-        "ts": time.time(),
-        "source": source,
-    }
+    add_history_message(latest_text, latest_latency, source)
 
 
 # ---------------------------------------------------------------------
@@ -441,6 +446,8 @@ def main():
     # 最新結果 (右側顯示用)
     if "vlm_latest" not in st.session_state:
         st.session_state.vlm_latest = None  # dict: {text, latency, ts}
+    if "vlm_history" not in st.session_state:
+        st.session_state.vlm_history = []
     if "capture_interval_sec" not in st.session_state:
         st.session_state.capture_interval_sec = 5
 
@@ -502,24 +509,25 @@ def main():
                 frame_image = decode_image_data_url(capture_event["image_data_url"])
                 run_inference(cfg_snapshot, frame_image, capture_event.get("source", "auto"))
             except Exception as exc:
-                st.session_state.vlm_latest = {
-                    "text": f"Error: {exc}",
-                    "latency": 0.0,
-                    "ts": time.time(),
-                    "source": "error",
-                }
+                add_history_message(f"Error: {exc}", 0.0, "error")
 
     # ---- 右側：對話視窗 ----
     with col2:
         st.subheader("VLM Inference")
+        if st.button("Clear history", use_container_width=True):
+            st.session_state.vlm_latest = None
+            st.session_state.vlm_history = []
+            st.rerun()
 
-        if st.session_state.vlm_latest:
-            msg = st.session_state.vlm_latest
-            with st.chat_message("assistant"):
-                st.markdown(msg["text"])
-                st.caption(
-                    f"Latency: {msg['latency']:.0f} ms | Source: {msg.get('source', 'auto')}"
-                )
+        if st.session_state.vlm_history:
+            history_container = st.container(height=520)
+            for msg in st.session_state.vlm_history:
+                with history_container.chat_message("assistant"):
+                    st.markdown(msg["text"])
+                    st.caption(
+                        f"Latency: {msg['latency']:.0f} ms | Source: {msg.get('source', 'auto')} | "
+                        f"Time: {time.strftime('%H:%M:%S', time.localtime(msg['ts']))}"
+                    )
         else:
             st.info("Waiting for the webcam stream and first response from the VLM...")
 
