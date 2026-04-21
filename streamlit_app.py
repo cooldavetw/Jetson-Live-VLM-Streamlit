@@ -522,6 +522,8 @@ def main():
         if st.session_state.vlm_history:
             history_container = st.container(height=520)
             for msg in st.session_state.vlm_history:
+                with history_container.chat_message("user"):
+                    st.markdown(cfg_snapshot.prompt)
                 with history_container.chat_message("assistant"):
                     st.markdown(msg["text"])
                     st.caption(
