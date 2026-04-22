@@ -26,6 +26,7 @@ CAMERA_COMPONENT = st.components.v2.component(
   <div class="camera-preview-wrap">
     <video class="camera-preview" autoplay playsinline muted></video>
     <div class="camera-placeholder">Camera inactive</div>
+    <div class="camera-capture-feedback" aria-hidden="true"></div>
   </div>
   <canvas class="camera-canvas" aria-hidden="true"></canvas>
   <div class="camera-controls">
@@ -85,6 +86,39 @@ CAMERA_COMPONENT = st.components.v2.component(
   display: none;
 }
 
+.camera-capture-feedback {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0;
+  border: 0 solid rgba(255, 255, 255, 0);
+  box-shadow: inset 0 0 0 0 rgba(255, 255, 255, 0);
+  background: rgba(255, 255, 255, 0);
+  transition:
+    opacity 120ms ease,
+    border-width 120ms ease,
+    box-shadow 120ms ease,
+    background-color 120ms ease;
+}
+
+.camera-capture-feedback.is-active {
+  opacity: 1;
+}
+
+.camera-capture-feedback.is-auto {
+  border-width: 2px;
+  border-color: rgba(255, 255, 255, 0.78);
+  box-shadow: inset 0 0 0 1px rgba(64, 193, 255, 0.6);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.camera-capture-feedback.is-manual {
+  border-width: 4px;
+  border-color: rgba(255, 214, 102, 0.95);
+  box-shadow: inset 0 0 0 2px rgba(255, 255, 255, 0.78);
+  background: rgba(255, 255, 255, 0.18);
+}
+
 .camera-controls {
   display: flex;
   gap: 0.75rem;
@@ -138,6 +172,7 @@ function createInstance(component) {
   const root = parentElement.querySelector(".camera-shell");
   const video = root.querySelector(".camera-preview");
   const placeholder = root.querySelector(".camera-placeholder");
+  const feedback = root.querySelector(".camera-capture-feedback");
   const canvas = root.querySelector(".camera-canvas");
   const startBtn = root.querySelector(".camera-start");
   const stopBtn = root.querySelector(".camera-stop");
@@ -162,6 +197,7 @@ function createInstance(component) {
     lastCaptureTs: 0,
     lastStatus: null,
     lastPlaying: null,
+    feedbackTimeoutId: null,
   };
 
   instance.setStatus = (message, isError = false) => {
@@ -187,11 +223,34 @@ function createInstance(component) {
     snapshotBtn.disabled = !active;
   };
 
+  instance.flashCaptureFeedback = (source) => {
+    if (instance.feedbackTimeoutId) {
+      clearTimeout(instance.feedbackTimeoutId);
+      instance.feedbackTimeoutId = null;
+    }
+
+    feedback.classList.remove("is-auto", "is-manual", "is-active");
+    feedback.classList.add(source === "manual" ? "is-manual" : "is-auto");
+    // Force a style recalculation so repeated captures re-trigger the transition.
+    void feedback.offsetWidth;
+    feedback.classList.add("is-active");
+
+    instance.feedbackTimeoutId = window.setTimeout(() => {
+      feedback.classList.remove("is-active", "is-auto", "is-manual");
+      instance.feedbackTimeoutId = null;
+    }, source === "manual" ? 260 : 180);
+  };
+
   instance.stopStream = () => {
     if (instance.timerId) {
       clearInterval(instance.timerId);
       instance.timerId = null;
     }
+    if (instance.feedbackTimeoutId) {
+      clearTimeout(instance.feedbackTimeoutId);
+      instance.feedbackTimeoutId = null;
+    }
+    feedback.classList.remove("is-active", "is-auto", "is-manual");
     if (instance.stream) {
       instance.stream.getTracks().forEach((track) => track.stop());
       instance.stream = null;
@@ -216,6 +275,7 @@ function createInstance(component) {
     const imageDataUrl = canvas.toDataURL("image/jpeg", 0.85);
     const ts = Date.now();
     instance.lastCaptureTs = ts;
+    instance.flashCaptureFeedback(source);
     instance.component.setTriggerValue("capture", {
       image_data_url: imageDataUrl,
       ts,
