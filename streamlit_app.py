@@ -496,9 +496,9 @@ def main():
     # 初始化 session_state
     if "vlm_config_snapshot" not in st.session_state:
         st.session_state.vlm_config_snapshot = VLMConfig(
-            api_base="http://192.168.66.26:40960/v1",
-            api_key="",
-            model="vlm",
+            api_base="http://llm-proxy:4000/v1",
+            api_key="abcd",
+            model="vlm-2b",
             prompt="Describe the scene in details in traditional chinese.",
             max_tokens=300,
         )
